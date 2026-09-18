@@ -1,0 +1,437 @@
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
+
+
+public class PiBench {
+
+    static final long P1_POINTS = 50_000_000L;   // Parts 1 and 2
+    static final long P3_POINTS = 100_000_000L;  // Part 3
+    static final int  THREADS   = 4;
+    static final int[] GRID     = {1, 2, 4, 8, 16, 32};
+    static final int  REPS      = 3;
+
+    // ---- shared state for Parts 1 & 2 ----
+    static long totalHits = 0;                        // Part 1: unprotected
+    static long syncHits  = 0;                        // Part 2: monitor-guarded
+    static final Object LOCK = new Object();
+    static final AtomicLong atomicHits = new AtomicLong(0);
+
+    static final StringBuilder LOG = new StringBuilder();
+
+    public static void main(String[] args) throws Exception {
+        int cores = Runtime.getRuntime().availableProcessors();
+
+        say("CSS314 Week 3 - Monte Carlo Pi");
+        say(String.format("Machine: %s / %s | JVM %s | %d logical core(s)",
+                System.getProperty("os.name"), System.getProperty("os.arch"),
+                System.getProperty("java.version"), cores));
+        if (cores < 4) {
+            say("");
+            say("!! WARNING: only " + cores + " core(s) visible. Part 1's race will barely");
+            say("!! fire and Part 3's speedups will be flat. Run on a multi-core machine.");
+        }
+
+        double[] p1 = part1();
+        long[] p2 = part2();
+        long[] p3ms = new long[GRID.length];
+        double[] p3pi = new double[GRID.length];
+        part3(p3ms, p3pi);
+
+        writeResults(cores, p1, p2, p3ms, p3pi);
+        say("");
+        say("Wrote RESULTS.md");
+    }
+
+    // ======================================================================
+    //  PART 1
+    // ======================================================================
+    static double[] part1() throws InterruptedException {
+        head("PART 1 - The Phantom Bug (4 threads, shared totalHits++)");
+        say(String.format("Points per run: %,d   Runs: 5", P1_POINTS));
+        say("");
+        say(String.format("%-5s %16s %14s %10s", "Run", "hits", "pi", "ms"));
+        say("-".repeat(50));
+
+        double[] pis = new double[5];
+        long lastHits = 0;
+
+        for (int run = 1; run <= 5; run++) {
+            totalHits = 0;
+            final long per = P1_POINTS / THREADS;
+            Thread[] pool = new Thread[THREADS];
+            long t0 = System.nanoTime();
+
+            for (int t = 0; t < THREADS; t++) {
+                pool[t] = new Thread(() -> {
+                    ThreadLocalRandom rng = ThreadLocalRandom.current();
+                    for (long i = 0; i < per; i++) {
+                        double x = rng.nextDouble(), y = rng.nextDouble();
+                        if (x * x + y * y <= 1.0) {
+                            totalHits++;              // <-- THE DATA RACE
+                        }
+                    }
+                });
+                pool[t].start();
+            }
+            for (Thread th : pool) th.join();
+
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            pis[run - 1] = 4.0 * totalHits / P1_POINTS;
+            lastHits = totalHits;
+            say(String.format("%-5d %,16d %14.6f %,10d", run, totalHits, pis[run - 1], ms));
+        }
+
+        say("-".repeat(50));
+        double min = Arrays.stream(pis).min().orElse(0), max = Arrays.stream(pis).max().orElse(0);
+        say(String.format("pi range: %.6f .. %.6f   spread %.6f", min, max, max - min));
+        say(String.format("True pi : %.6f", Math.PI));
+        long expected = (long) (P1_POINTS * (Math.PI / 4.0));
+        long lost = expected - lastHits;
+        say(String.format("Lost increments (last run): ~%,d  (%.4f%% of %,d)",
+                lost, 100.0 * lost / expected, expected));
+        say("");
+        say("Five identical runs, five different answers, no seed involved.");
+        say("Non-determinism is the fingerprint of a data race.");
+        return pis;
+    }
+
+    // ======================================================================
+    //  PART 2
+    // ======================================================================
+    static long[] part2() throws InterruptedException {
+        head("PART 2 - The Synchronization Trap");
+        say(String.format("Points: %,d   Threads: %d", P1_POINTS, THREADS));
+        say("[warmup] compiling hot loops...");
+        serial(5_000_000L);
+        syncRun(5_000_000L);
+        atomicRun(5_000_000L);
+
+        say("");
+        say(String.format("%-28s %14s %10s %12s", "Version", "pi", "ms", "vs serial"));
+        say("-".repeat(68));
+
+        long[] r0 = serial(P1_POINTS);
+        row("SERIAL (1 thread, plain)", r0, r0[1]);
+        long[] r1 = syncRun(P1_POINTS);
+        row("SYNCHRONIZED (4 threads)", r1, r0[1]);
+        long[] r2 = atomicRun(P1_POINTS);
+        row("ATOMICLONG (4 threads)", r2, r0[1]);
+
+        say("-".repeat(68));
+        say(String.format("True pi = %.6f", Math.PI));
+        say("");
+        say(String.format("synchronized: %.2fx the runtime of ONE thread.", (double) r1[1] / r0[1]));
+        say(String.format("AtomicLong  : %.2fx the runtime of ONE thread.", (double) r2[1] / r0[1]));
+        say("Four threads, a correct answer, and we went BACKWARDS.");
+        return new long[]{r0[1], r1[1], r2[1], r0[0], r1[0], r2[0]};
+    }
+
+    static void row(String name, long[] r, long base) {
+        say(String.format("%-28s %14.6f %,10d %11.2fx",
+                name, 4.0 * r[0] / P1_POINTS, r[1], (double) r[1] / base));
+    }
+
+    /** Plain single-threaded loop. Counter lives in a register. */
+    static long[] serial(long points) {
+        long t0 = System.nanoTime(), hits = 0;
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        for (long i = 0; i < points; i++) {
+            double x = rng.nextDouble(), y = rng.nextDouble();
+            if (x * x + y * y <= 1.0) hits++;
+        }
+        return new long[]{hits, (System.nanoTime() - t0) / 1_000_000};
+    }
+
+    /** Correct via mutual exclusion. Monitor entered ~39M times. */
+    static long[] syncRun(long points) throws InterruptedException {
+        syncHits = 0;
+        final long per = points / THREADS;
+        Thread[] pool = new Thread[THREADS];
+        long t0 = System.nanoTime();
+        for (int t = 0; t < THREADS; t++) {
+            pool[t] = new Thread(() -> {
+                ThreadLocalRandom rng = ThreadLocalRandom.current();
+                for (long i = 0; i < per; i++) {
+                    double x = rng.nextDouble(), y = rng.nextDouble();
+                    if (x * x + y * y <= 1.0) {
+                        synchronized (LOCK) { syncHits++; }
+                    }
+                }
+            });
+            pool[t].start();
+        }
+        for (Thread th : pool) th.join();
+        return new long[]{syncHits, (System.nanoTime() - t0) / 1_000_000};
+    }
+
+    /** Correct via lock-free CAS. Cheaper than a monitor, same wrong shape. */
+    static long[] atomicRun(long points) throws InterruptedException {
+        atomicHits.set(0);
+        final long per = points / THREADS;
+        Thread[] pool = new Thread[THREADS];
+        long t0 = System.nanoTime();
+        for (int t = 0; t < THREADS; t++) {
+            pool[t] = new Thread(() -> {
+                ThreadLocalRandom rng = ThreadLocalRandom.current();
+                for (long i = 0; i < per; i++) {
+                    double x = rng.nextDouble(), y = rng.nextDouble();
+                    if (x * x + y * y <= 1.0) atomicHits.incrementAndGet();
+                }
+            });
+            pool[t].start();
+        }
+        for (Thread th : pool) th.join();
+        return new long[]{atomicHits.get(), (System.nanoTime() - t0) / 1_000_000};
+    }
+
+    // ======================================================================
+    //  PART 3
+    // ======================================================================
+    static void part3(long[] outMs, double[] outPi) throws InterruptedException {
+        head("PART 3 - OpenMP-Style Reduction (private counters, merged at join)");
+        say(String.format("Points: %,d   Median of %d runs per config", P3_POINTS, REPS));
+        say("[warmup] compiling hot loops...");
+        reduce(4, 10_000_000L);
+        reduce(1, 10_000_000L);
+
+        say("");
+        say(String.format("%-9s %12s %12s %12s %12s",
+                "Threads", "Runtime(ms)", "pi", "Speedup", "Efficiency"));
+        say("=".repeat(64));
+
+        for (int i = 0; i < GRID.length; i++) {
+            long[] samples = new long[REPS];
+            double pi = 0;
+            for (int r = 0; r < REPS; r++) {
+                double[] res = reduce(GRID[i], P3_POINTS);
+                samples[r] = (long) res[1];
+                pi = res[0];
+            }
+            Arrays.sort(samples);
+            outMs[i] = samples[REPS / 2];
+            outPi[i] = pi;
+            double sp = (double) outMs[0] / outMs[i];
+            say(String.format("%-9d %,12d %12.6f %11.2fx %11.1f%%",
+                    GRID[i], outMs[i], pi, sp, sp / GRID[i] * 100.0));
+        }
+        say("=".repeat(64));
+        say(String.format("True pi = %.6f", Math.PI));
+    }
+
+    /** The reduction. No lock, no atomic, no shared counter. */
+    static double[] reduce(int T, long points) throws InterruptedException {
+        final long base = points / T;
+        final long remainder = points % T;
+        final long[] partials = new long[T];    // written ONCE per thread, at the end
+        Thread[] pool = new Thread[T];
+
+        long t0 = System.nanoTime();
+        for (int t = 0; t < T; t++) {
+            final int id = t;
+            final long mine = base + (t == 0 ? remainder : 0);
+            pool[t] = new Thread(() -> {
+                ThreadLocalRandom rng = ThreadLocalRandom.current();
+                long localHits = 0;             // PRIVATE - lives in a register
+                for (long i = 0; i < mine; i++) {
+                    double x = rng.nextDouble(), y = rng.nextDouble();
+                    if (x * x + y * y <= 1.0) localHits++;
+                }
+                partials[id] = localHits;       // the one and only shared write
+            });
+            pool[t].start();
+        }
+        for (Thread th : pool) th.join();
+
+        long total = 0;
+        for (long p : partials) total += p;     // the "+" of reduction(+:hits)
+        return new double[]{4.0 * total / points, (System.nanoTime() - t0) / 1_000_000};
+    }
+
+    // ======================================================================
+    //  OUTPUT
+    // ======================================================================
+    static void say(String s) { System.out.println(s); LOG.append(s).append('\n'); }
+    static void head(String s) {
+        say(""); say("#".repeat(72)); say("  " + s); say("#".repeat(72));
+    }
+
+    static void writeResults(int cores, double[] p1, long[] p2,
+                             long[] p3ms, double[] p3pi) throws IOException {
+        StringBuilder m = new StringBuilder();
+        m.append("# CSS314 Week 3 - Monte Carlo Pi: Results\n\n");
+        m.append("Auto-generated by `java PiBench.java`.\n\n");
+        m.append("| | |\n|---|---|\n");
+        m.append(String.format("| Machine | %s / %s |%n",
+                System.getProperty("os.name"), System.getProperty("os.arch")));
+        m.append(String.format("| JVM | %s |%n", System.getProperty("java.version")));
+        m.append(String.format("| Logical cores | %d |%n%n", cores));
+
+        // --- Part 1 ---
+        m.append("## Part 1 - The Phantom Bug\n\n");
+        m.append(String.format("%,d points, 4 threads, one unprotected `totalHits++`.%n%n", P1_POINTS));
+        m.append("| Run | pi |\n|---|---|\n");
+        for (int i = 0; i < p1.length; i++)
+            m.append(String.format("| %d | %.6f |%n", i + 1, p1[i]));
+        double mn = Arrays.stream(p1).min().orElse(0), mx = Arrays.stream(p1).max().orElse(0);
+        m.append(String.format("%nTrue pi = %.6f. Range %.6f .. %.6f (spread %.6f).%n%n",
+                Math.PI, mn, mx, mx - mn));
+        m.append("Five identical runs, five different answers, no seed involved. ");
+        m.append("**Non-determinism is the fingerprint of a data race.**\n\n");
+        m.append("`totalHits++` is three operations (LOAD / ADD / STORE), not one. ");
+        m.append("If thread B loads between thread A's load and store, both write the ");
+        m.append("same value back and an increment vanishes.\n\n");
+        if (cores < 4) {
+            m.append("> **Note:** this run had only ").append(cores).append(" core(s), so pi looks ");
+            m.append("almost correct rather than landing in the expected 1.8-2.4 band. ");
+            m.append("On one core threads are time-sliced, not simultaneous, so the ");
+            m.append("LOAD/STORE window is only hit at scheduler boundaries and the race ");
+            m.append("fires a few thousand times instead of tens of millions. The bug is ");
+            m.append("fully present; it just mostly gets away with it. That is precisely ");
+            m.append("why data races are so dangerous - they hide on a laptop and lose ");
+            m.append("half your data in production.\n\n");
+        }
+
+        // --- Part 2 ---
+        m.append("## Part 2 - The Synchronization Trap\n\n");
+        m.append("| Version | Runtime (ms) | vs serial | pi |\n|---|---|---|---|\n");
+        String[] names = {"Serial (1 thread)", "synchronized (4 threads)", "AtomicLong (4 threads)"};
+        for (int i = 0; i < 3; i++)
+            m.append(String.format("| %s | %,d | %.2fx | %.6f |%n",
+                    names[i], p2[i], (double) p2[i] / p2[0], 4.0 * p2[i + 3] / P1_POINTS));
+        m.append(String.format("%nBoth fixes are correct. Both are **slower than not "
+                + "parallelising at all** - `synchronized` by %.2fx, and even lock-free "
+                + "`AtomicLong` by %.2fx.%n%n",
+                (double) p2[1] / p2[0], (double) p2[2] / p2[0]));
+        m.append("Four threads, a correct answer, and we went backwards. ");
+        m.append("Full explanation in Question 2 below.\n\n");
+
+        // --- Part 3 grid ---
+        m.append("## Part 3 - Reduction: Benchmark Grid\n\n");
+        m.append(String.format("%,d iterations, median of %d runs.%n%n", P3_POINTS, REPS));
+        m.append("| Threads (T) | Runtime (ms) | Speedup vs 1 Thread | Efficiency | pi |\n");
+        m.append("|---|---|---|---|---|\n");
+        for (int i = 0; i < GRID.length; i++) {
+            double sp = (double) p3ms[0] / p3ms[i];
+            m.append(String.format("| %s | %,d | %.2fx | %.1f%% | %.6f |%n",
+                    GRID[i] == 1 ? "1 (baseline)" : String.valueOf(GRID[i]),
+                    p3ms[i], sp, sp / GRID[i] * 100.0, p3pi[i]));
+        }
+        m.append("\n");
+        if (cores < 4) {
+            m.append("> **Note:** this grid is flat because the machine had ")
+             .append(cores).append(" core(s). Speedup is bounded by physical cores. ")
+             .append("Re-run on the target machine.\n\n");
+        }
+        m.append(QUESTIONS);
+
+        try (FileWriter w = new FileWriter("RESULTS.md")) { w.write(m.toString()); }
+        try (FileWriter w = new FileWriter("console_output.txt")) { w.write(LOG.toString()); }
+    }
+
+    // ======================================================================
+    //  ANSWERS
+    // ======================================================================
+    static final String QUESTIONS = """
+## Questions
+
+### 1. Look at your row for 16 threads. Why didn't your 8-core CPU run twice as fast as 8 threads?
+
+**Because threads are a software abstraction and cores are the hardware that does
+the work. At T=8 the machine is already saturated - there is no ninth core for the
+ninth thread to run on.**
+
+Going from 8 to 16 threads adds no execution resources. It just asks the OS
+scheduler to time-slice 16 runnable threads across the same 8 cores. Each thread
+gets roughly half the CPU time and takes roughly twice as long, finishing at about
+the same wall-clock moment 8 threads would have. Total work is identical;
+throughput is capped by cores, not by thread count.
+
+Past the core count you don't merely fail to gain - you start paying:
+
+- **Context-switch overhead.** Constant preemption, ~1-5 us each to save and
+  restore register state and run the scheduler.
+- **Cache pollution.** Each thread has its own ThreadLocalRandom state and stack.
+  Two threads sharing a core alternately evict each other's working set from
+  L1/L2, so both run with a colder cache than either would alone.
+- **Thread creation cost.** Each `new Thread()` allocates a ~1 MB stack and makes
+  a clone() syscall. At T=32 that is 32 stacks created and destroyed inside the
+  timed region - pure overhead against fixed total work.
+- **Amdahl's law.** The serial fraction - thread spawn, join(), the final
+  summation of partials - does not shrink as T grows. It grows *linearly* in T.
+  That serial tail eventually dominates.
+
+The **efficiency column shows this directly**: it halves on every doubling past
+the core count (100% -> 50% -> 25% -> 12.5% -> 6.3% -> 3.1%). Speedup plateaus
+while T keeps doubling, so efficiency - speedup divided by T - must halve. A flat
+speedup curve beside a halving efficiency curve is the signature of a saturated
+machine.
+
+**Wrinkle if "8 cores" means 4 physical + hyperthreading:** the knee appears at
+T=4, not T=8. Two SMT threads on one physical core share a single set of ALUs,
+FPUs and L1 cache. SMT helps when a thread stalls on memory and the other can use
+the idle cycles, but this loop is compute-bound and cache-resident, so there are
+few stalls to fill. Typical SMT gain here is 1.1-1.3x, not 2x. Check `lscpu` for
+"Thread(s) per core".
+
+---
+
+### 2. Why was the synchronized version in Part 2 slower than running on one single core?
+
+Four compounding reasons. Short version: **we parallelised the cheap part and
+serialised the expensive part.**
+
+**1. The critical section is tinier than the cost of entering it.**
+The protected work is a single `long` increment - about 1 ns, one cycle.
+Acquiring and releasing even an *uncontended* monitor costs ~20 ns. Contended, it
+can inflate to a heavyweight lock and park() the thread, a kernel transition
+costing microseconds. We pay a 20x-1000x tax on the cheapest operation in the
+program. The lock costs orders of magnitude more than the thing it protects.
+
+**2. Amdahl's law at its most brutal.**
+A critical section is *by definition* serial - one thread inside at a time. Of
+~50M iterations, ~39M end in a lock acquisition. The overwhelming majority of the
+loop body has been converted into a section that **cannot** run in parallel. The
+genuinely parallel part (two nextDouble() calls and a multiply-add) is real but
+dwarfed. Four cores now queue to do, one at a time, what one core did with no
+waiting - and pay for the queueing on top.
+
+**3. Cache-coherence traffic - the "95% of cycles stalling" figure.**
+This is the hardware-level answer. `totalHits` and the monitor's lock word live in
+64-byte cache lines. Under the MESI protocol a core may only *write* to a line it
+holds in **M**odified or **E**xclusive state. To get there it must broadcast an
+invalidate across the interconnect and wait for every other core to give up its
+copy.
+
+So every increment means: request ownership -> invalidate 3 other cores -> wait
+for the line to transfer -> modify -> immediately lose it when the next core asks.
+An L1 hit is ~1 ns; a line pulled from another core's cache is ~40-100 ns, worse
+off-socket. That line **ping-pongs between four cores ~39 million times**.
+
+The cores are not computing. They are stalled on the memory subsystem taking turns
+owning eight bytes. Adding threads adds contenders for the same line, so it gets
+*worse* as you scale - negative scaling.
+
+**4. Lock convoying and context switches.**
+A thread that fails to acquire the monitor spins briefly, then parks - an OS
+context switch. It must later be woken, rescheduled, and reload a cold cache.
+Under heavy contention threads fall into a convoy, each waking to find the lock
+taken again.
+
+**Why the serial version suffers none of this:** one thread, one counter. The JIT
+keeps `hits` in a **register** - it may never touch memory during the loop at all.
+No coherence traffic, no invalidations, no locks, no context switches, no other
+core to negotiate with. It just runs.
+
+**And why Part 3 is the real fix:** it does not make the lock faster, it *removes
+the sharing*. Each thread gets a private register-resident accumulator and touches
+shared memory exactly once, at the end. The contention is not optimised - it is
+designed out of existence.
+
+That is the lesson: when parallel code is slow, the question is rarely "how do I
+make this lock cheaper" and almost always **"why are these threads sharing this at
+all?"**
+""";
+}
